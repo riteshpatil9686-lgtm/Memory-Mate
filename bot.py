@@ -113,8 +113,11 @@ DAY_MAP = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
            "friday": 4, "saturday": 5, "sunday": 6}
 
 OFFSET_PATTERN = re.compile(
-    r"remind me (?:at|for|in|about) "
-    r"((?:\d+\s*(?:min(?:ute)?s?|hour(?:s)?|day(?:s)?|h|m)\s*)+)",
+    r"remind me "
+    r"(?:(?:at|for|in|about)\s+)?"
+    r"(\d+\s*(?:min(?:ute)?s?|hour(?:s)?|day(?:s)?|h|m)"
+    r"(?:\s+\d+\s*(?:min(?:ute)?s?|hour(?:s)?|day(?:s)?|h|m))*)"
+    r"(?:\s+before)?",
     re.IGNORECASE
 )
 
@@ -214,6 +217,15 @@ def parse_dual_time(text):
         else:
             event_text = text.replace(offset_match.group(0), "").strip()
         event_dt = dateparser.parse(event_text, settings=dp_settings)
+        # Use search_dates as fallback for noisy event text (e.g. "the meeting today at 2pm")
+        if not event_dt:
+            try:
+                from dateparser.search import search_dates
+                results = search_dates(event_text, languages=["en"], settings=dp_settings)
+                if results:
+                    event_dt = results[-1][1]
+            except:
+                pass
         if event_dt:
             reminder_dt = event_dt - timedelta(seconds=total_seconds)
             title = clean_title(event_text)
@@ -395,6 +407,36 @@ async def add_reminder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.info("No rec_rule — leaving ra_utc unchanged at %s", ra_utc.isoformat())
     # ── End fix ──
 
+    # ── Past reminder check (non-interval reminders only) ──
+    now_utc = datetime.now(timezone.utc)
+    if rec != "interval" and ra_utc <= now_utc:
+        event_dt_raw = parsed.get("event_datetime")
+        event_dt_ist = None
+        if event_dt_raw:
+            try:
+                ev = datetime.fromisoformat(event_dt_raw)
+                if ev.tzinfo is None: ev = ev.replace(tzinfo=IST)
+                event_dt_ist = ev.astimezone(IST)
+            except:
+                pass
+        reply = "⚠️ Your reminder time (" + fmt_ist(ra) + ") has already passed."
+        if event_dt_ist:
+            reply += "\nThe meeting is at " + fmt_ist(event_dt_ist) + "."
+        reply += "\n\nWould you like me to remind you immediately instead?"
+        ctx.user_data["pending_immediate"] = {
+            "user_id": u.id, "chat_id": cid,
+            "message": msg, "task_title": task,
+            "event_datetime": event_dt_raw,
+        }
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔔 Remind Now", callback_data="rimm_yes"),
+             InlineKeyboardButton("❌ Cancel", callback_data="rimm_no")]
+        ])
+        await update.message.reply_text(reply, reply_markup=kb)
+        conn.close()
+        return
+    # ── End past reminder check ──
+
     # ── DEBUG: final values before DB write ──
     log.info("FINAL remind_at written to DB: %s", ra_utc.isoformat())
     event_dt = parsed.get("event_datetime")
@@ -525,8 +567,15 @@ async def toggle_brief(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def send_reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
     d = ctx.job.data; rid = d.get("rid"); cid = d.get("c")
     conn = get_db()
+    # ── Atomically claim this reminder (prevents duplicate sends from race) ──
+    cur = conn.execute("UPDATE reminders SET is_sent=1 WHERE id=? AND is_sent=0", (rid,))
+    conn.commit()
+    if cur.rowcount == 0:
+        conn.close()
+        return
     row = conn.execute("SELECT * FROM reminders WHERE id=?", (rid,)).fetchone()
-    if not row or row["is_sent"]: conn.close(); return
+    if not row:
+        conn.close(); return
     try:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Done", callback_data="d"+str(rid)),
@@ -540,7 +589,11 @@ async def send_reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(chat_id=cid, text=msg, reply_markup=kb)
         log.info("Sent #%d", rid)
     except Exception as e:
-        log.error("Send #%d failed: %s", rid, e); conn.close(); return
+        log.error("Send #%d failed: %s", rid, e)
+        # Revert the is_sent claim on failure so periodic_check can retry
+        conn.execute("UPDATE reminders SET is_sent=0 WHERE id=?", (rid,))
+        conn.commit(); conn.close()
+        return
     rec = row["recurrence"]
     rec_rule_str = row["recurrence_rule"]
     rec_rule = None
@@ -552,7 +605,7 @@ async def send_reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
     base_dt = datetime.fromisoformat(row["remind_at"])
     if base_dt.tzinfo is None:
         base_dt = base_dt.replace(tzinfo=timezone.utc)
-    # Mark this instance as fired (duplicate prevention)
+    # Mark this instance as fired (additional safety dedup)
     conn.execute(
         "INSERT OR IGNORE INTO fired_instances (reminder_id, scheduled_at) VALUES (?,?)",
         (rid, base_dt.isoformat())
@@ -602,17 +655,52 @@ async def send_reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
     elif rec == "weekly":
         next_dt = base_dt + timedelta(days=7)
     if next_dt and next_dt > datetime.now(timezone.utc):
-        conn.execute("UPDATE reminders SET remind_at=? WHERE id=?", (next_dt.isoformat(), rid))
+        conn.execute("UPDATE reminders SET remind_at=?, is_sent=0 WHERE id=?", (next_dt.isoformat(), rid))
         if ctx.job_queue:
+            # Remove any stale job before scheduling new one
+            for j in ctx.job_queue.get_jobs_by_name("r"+str(rid)):
+                j.schedule_removal()
             ctx.job_queue.run_once(send_reminder_callback, when=next_dt,
                                    data={"rid": rid, "c": cid}, name="r"+str(rid))
         log.info("Recurrence #%d next at %s", rid, next_dt.isoformat())
-    else:
-        conn.execute("UPDATE reminders SET is_sent=1 WHERE id=?", (rid,))
+    # else: is_sent stays 1 (already set by atomic claim above), no further action
     conn.commit(); conn.close()
 
 async def button_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
+    # ── Handle immediate-reminder confirmation callbacks ──
+    if q.data.startswith("rimm_"):
+        pending = ctx.user_data.pop("pending_immediate", None)
+        if q.data == "rimm_no":
+            await q.edit_message_text("❌ Cancelled.")
+            return
+        if not pending:
+            await q.edit_message_text("No pending reminder.")
+            return
+        if q.data == "rimm_yes":
+            # Insert reminder as already sent
+            conn = get_db()
+            now_utc = datetime.now(timezone.utc)
+            cur = conn.execute(
+                "INSERT INTO reminders (user_id, chat_id, message, remind_at, is_sent, task_title, event_datetime) VALUES (?,?,?,?,1,?,?)",
+                (pending["user_id"], pending["chat_id"], pending["message"],
+                 now_utc.isoformat(), pending["task_title"], pending.get("event_datetime"))
+            )
+            rid = cur.lastrowid
+            conn.commit(); conn.close()
+            # Send the reminder now
+            msg = "🔔 Reminder!\n\n" + pending["task_title"]
+            if pending.get("event_datetime"):
+                try:
+                    ev = datetime.fromisoformat(pending["event_datetime"])
+                    if ev.tzinfo is None: ev = ev.replace(tzinfo=timezone.utc)
+                    msg += "\n📅 Event: " + fmt_ist(ev)
+                except:
+                    pass
+            await ctx.bot.send_message(chat_id=pending["chat_id"], text=msg)
+            await q.edit_message_text("✅ Reminder sent now!")
+        return
+    # ── Existing Done/Snooze handling ──
     rid = int(q.data[1:])
     if q.data.startswith("d"):
         uid = update.effective_user.id
@@ -710,6 +798,16 @@ async def recover_missed(app):
     if missed:
         log.info("Recovering %d missed", len(missed))
         for row in missed:
+            jname = "r" + str(row["id"])
+            # Check if a job already exists for this reminder
+            if app.job_queue and app.job_queue.get_jobs_by_name(jname):
+                log.info("Skipping recover #%d — already scheduled", row["id"])
+                continue
+            # Atomically claim this reminder before sending
+            cur = conn.execute("UPDATE reminders SET is_sent=1 WHERE id=? AND is_sent=0", (row["id"],))
+            conn.commit()
+            if cur.rowcount == 0:
+                continue
             try:
                 await app.bot.send_message(chat_id=row["chat_id"],
                     text="Reminder!\n(missed)\n\n" + row["message"])
@@ -748,9 +846,11 @@ async def recover_missed(app):
                         elif days: next_dt += timedelta(days=days)
                     else: break
                 if next_dt > n:
-                    conn.execute("UPDATE reminders SET remind_at=? WHERE id=?", (next_dt.isoformat(), row["id"]))
-                    app.job_queue.run_once(send_reminder_callback, when=next_dt,
-                                           data={"rid": row["id"], "c": row["chat_id"]}, name="r"+str(row["id"]))
+                    conn.execute("UPDATE reminders SET remind_at=?, is_sent=0 WHERE id=?", (next_dt.isoformat(), row["id"]))
+                    jname = "r" + str(row["id"])
+                    if not app.job_queue.get_jobs_by_name(jname):
+                        app.job_queue.run_once(send_reminder_callback, when=next_dt,
+                                               data={"rid": row["id"], "c": row["chat_id"]}, name=jname)
                 else:
                     conn.execute("UPDATE reminders SET is_sent=1 WHERE id=?", (row["id"],))
             elif rec in ("daily", "weekdays"):
@@ -759,9 +859,11 @@ async def recover_missed(app):
                 nt = n.replace(hour=base.hour, minute=base.minute) + delta
                 if rec == "weekdays":
                     while nt.weekday() >= 5: nt += timedelta(days=1)
-                conn.execute("UPDATE reminders SET remind_at=? WHERE id=?", (nt.isoformat(), row["id"]))
-                app.job_queue.run_once(send_reminder_callback, when=nt,
-                                       data={"rid": row["id"], "c": row["chat_id"]}, name="r"+str(row["id"]))
+                conn.execute("UPDATE reminders SET remind_at=?, is_sent=0 WHERE id=?", (nt.isoformat(), row["id"]))
+                jname = "r" + str(row["id"])
+                if not app.job_queue.get_jobs_by_name(jname):
+                    app.job_queue.run_once(send_reminder_callback, when=nt,
+                                           data={"rid": row["id"], "c": row["chat_id"]}, name=jname)
             else:
                 conn.execute("UPDATE reminders SET is_sent=1 WHERE id=?", (row["id"],))
         conn.commit()
@@ -820,7 +922,7 @@ def main():
     app.add_handler(CommandHandler("stop", stop_recurring))
     app.add_handler(CommandHandler("brief", toggle_brief))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(button_callback, pattern=r"^(d[0-9]|s[0-9])"))
+    app.add_handler(CallbackQueryHandler(button_callback, pattern=r"^(d[0-9]|s[0-9]|rimm_)"))
     app.add_error_handler(error_handler)
     log.info("Started polling...")
     app.run_polling()
