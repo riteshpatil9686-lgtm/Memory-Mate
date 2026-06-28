@@ -192,6 +192,7 @@ def clean_title(text):
 def parse_dual_time(text):
     """Extract event_time + reminder_time from dual-time patterns."""
     import dateparser
+    from dateparser.search import search_dates
     dp_settings = {"TIMEZONE": "Asia/Kolkata", "RETURN_AS_TIMEZONE_AWARE": True}
     lower = text.lower()
     offset_match = OFFSET_PATTERN.search(lower)
@@ -257,6 +258,22 @@ def parse_dual_time(text):
         if event_seg and remind_seg:
             event_dt = dateparser.parse(event_seg, settings=dp_settings)
             remind_dt = dateparser.parse(remind_seg, settings=dp_settings)
+            # Fallback: search_dates handles noisy event text (e.g. "by 11:45 tomorrow")
+            if not event_dt:
+                try:
+                    results = search_dates(event_seg, languages=["en"], settings=dp_settings)
+                    if results:
+                        event_dt = results[-1][1]
+                except:
+                    pass
+            # Fallback: search_dates handles noisy reminder text (e.g. "Remind me at 10:00 AM")
+            if not remind_dt:
+                try:
+                    results = search_dates(remind_seg, languages=["en"], settings=dp_settings)
+                    if results:
+                        remind_dt = results[-1][1]
+                except:
+                    pass
             if event_dt and remind_dt:
                 title = clean_title(event_seg)
                 return {
